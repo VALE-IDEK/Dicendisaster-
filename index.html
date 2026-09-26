@@ -24,8 +24,16 @@
   .dice { font-size: 48px; text-align: center; margin: 10px 0; }
   .log { max-height: 160px; overflow-y: auto; font-size: 13px; color: #bbb; }
   .log div { padding: 3px 0; border-bottom: 1px solid #222; }
-  .turn-badge { background: #ff6b6b; color: #1a1a2e; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+  .turn-badge { background: #ff6b6b; color: #1a1a2e; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; animation: pulseBadge 1s infinite; }
   .hidden { display: none; }
+  @keyframes diceRoll { 0%{transform:rotate(0deg) scale(1);} 50%{transform:rotate(200deg) scale(1.35);} 100%{transform:rotate(360deg) scale(1);} }
+  .rolling { animation: diceRoll 0.5s ease; display:inline-block; }
+  @keyframes flashHit { 0%{filter:brightness(1);} 30%{filter:brightness(2.2) saturate(2);} 100%{filter:brightness(1);} }
+  .hit-flash { animation: flashHit 0.45s; }
+  @keyframes pulseBadge { 0%,100%{transform:scale(1);} 50%{transform:scale(1.1);} }
+  @keyframes popIn { 0%{transform:scale(0.6);opacity:0;} 100%{transform:scale(1);opacity:1;} }
+  .log div:first-child { animation: popIn 0.3s ease; }
+  #timerDisplay { text-align:center; font-size:14px; margin-bottom:6px; transition: color 0.3s; }
 </style>
 </head>
 <body>
@@ -72,6 +80,7 @@
   <div id="partyBattleList" style="margin:14px 0;"></div>
 
   <div id="turnIndicator" style="text-align:center;font-weight:bold;margin:10px 0;"></div>
+  <div id="timerDisplay"></div>
   <div class="dice" id="diceDisplay">🎲</div>
 
   <div id="actionButtons"></div>
@@ -207,17 +216,21 @@ function startBattle(){
   roomRef.child('players').once('value').then(snap => {
     const keys = Object.keys(snap.val());
     roomRef.child('turnOrder').set(keys);
-    roomRef.child('turnIdx').set(0);
+    roomRef.child('turn').set({ idx: 0, startedAt: Date.now() });
     roomRef.child('log').set(["The battle begins! " + BOSS.name + " appears."]);
     roomRef.child('phase').set('battle');
   });
 }
 
+let turnOrderCache = [], turnState = { idx: 0, startedAt: Date.now() }, timerInterval = null;
+
 function listenBattle(){
   roomRef.child('boss').on('value', snap => {
     const b = snap.val(); if(!b) return;
     const pct = Math.max(0, b.hp/b.maxHp*100);
-    document.getElementById('bossHpFill').style.width = pct+'%';
+    const fill = document.getElementById('bossHpFill');
+    fill.style.width = pct+'%';
+    fill.classList.remove('hit-flash'); void fill.offsetWidth; fill.classList.add('hit-flash');
     document.getElementById('bossHpText').innerText = `${Math.max(0,b.hp)} / ${b.maxHp} HP`;
     if(b.hp <= 0) addActionButtons(false, true);
   });
@@ -233,31 +246,57 @@ function listenBattle(){
     checkTurn();
   });
 
-  roomRef.child('turnIdx').on('value', () => checkTurn());
+  roomRef.child('turnOrder').on('value', snap => { turnOrderCache = snap.val() || []; checkTurn(); });
+  roomRef.child('turn').on('value', snap => { turnState = snap.val() || { idx: 0, startedAt: Date.now() }; checkTurn(); });
   roomRef.child('log').on('value', snap => {
     const logs = snap.val() || [];
     document.getElementById('battleLog').innerHTML = logs.slice(-15).reverse().map(l=>`<div>${l}</div>`).join('');
   });
+
+  if(!timerInterval) timerInterval = setInterval(tickTimer, 1000);
+}
+
+function tickTimer(){
+  if(!turnOrderCache.length) return;
+  const elapsed = Math.floor((Date.now() - (turnState.startedAt||Date.now()))/1000);
+  const remaining = Math.max(0, 10 - elapsed);
+  const t = document.getElementById('timerDisplay');
+  if(t){
+    t.innerText = remaining > 0 ? `⏳ ${remaining}s left` : '⏳ time up!';
+    t.style.color = remaining <= 3 ? '#ff6b6b' : '#aaa';
+  }
+  if(remaining <= 0) trySkipTurn();
+}
+
+function trySkipTurn(){
+  const skippedIdx = turnState.idx, skippedStart = turnState.startedAt;
+  const order = turnOrderCache;
+  if(!order.length) return;
+  roomRef.child('turn').transaction(t => {
+    if(!t) return t;
+    if(t.idx !== skippedIdx || t.startedAt !== skippedStart) return; // someone already advanced it
+    return { idx: (t.idx+1) % order.length, startedAt: Date.now() };
+  }, (err, committed) => {
+    if(committed) pushLog(`${order[skippedIdx]} took too long and was skipped!`);
+  });
 }
 
 function checkTurn(){
-  Promise.all([
-    roomRef.child('turnOrder').once('value'),
-    roomRef.child('turnIdx').once('value'),
-    roomRef.child('players').once('value'),
-    roomRef.child('boss').once('value')
-  ]).then(([orderSnap, idxSnap, pSnap, bSnap]) => {
-    const order = orderSnap.val() || [];
-    const idx = idxSnap.val() || 0;
-    const players = pSnap.val() || {};
-    const boss = bSnap.val();
-    if(!order.length || !boss) return;
-    const currentName = order[idx % order.length];
-    const isMyTurn = currentName === myName && boss.hp > 0 && players[myName]?.hp > 0;
-    document.getElementById('turnIndicator').innerHTML = boss.hp<=0
-      ? `🎉 ${BOSS.name} is defeated! GG.`
-      : (isMyTurn ? `<span class="turn-badge">YOUR TURN</span>` : `Waiting on ${currentName}...`);
-    addActionButtons(isMyTurn, boss.hp<=0);
+  roomRef.child('players').once('value').then(pSnap => {
+    roomRef.child('boss').once('value').then(bSnap => {
+      const players = pSnap.val() || {};
+      const boss = bSnap.val();
+      const order = turnOrderCache;
+      if(!order.length || !boss) return;
+      const idx = turnState.idx || 0;
+      const currentName = order[idx % order.length];
+      const isMyTurn = currentName === myName && boss.hp > 0 && players[myName]?.hp > 0;
+      document.getElementById('turnIndicator').innerHTML = boss.hp<=0
+        ? `🎉 ${BOSS.name} is defeated! GG.`
+        : (isMyTurn ? `<span class="turn-badge">YOUR TURN</span>` : `Waiting on ${currentName}...`);
+      document.getElementById('timerDisplay').classList.toggle('hidden', boss.hp<=0);
+      addActionButtons(isMyTurn, boss.hp<=0);
+    });
   });
 }
 
@@ -272,7 +311,9 @@ function rollD20(){ return Math.floor(Math.random()*20)+1; }
 function doAction(type){
   document.getElementById('actionButtons').innerHTML = '';
   const roll = rollD20();
-  document.getElementById('diceDisplay').innerText = '🎲 ' + roll;
+  const dice = document.getElementById('diceDisplay');
+  dice.classList.remove('rolling'); void dice.offsetWidth; dice.classList.add('rolling');
+  dice.innerText = '🎲 ' + roll;
 
   roomRef.child('players/'+myName).once('value').then(snap => {
     const me = snap.val();
@@ -330,8 +371,11 @@ function doAction(type){
 
 function advanceTurn(){
   roomRef.child('turnOrder').once('value').then(snap => {
-    const order = snap.val();
-    roomRef.child('turnIdx').transaction(idx => ((idx||0)+1) % order.length);
+    const order = snap.val() || [];
+    roomRef.child('turn').transaction(t => {
+      if(!t) return { idx: 0, startedAt: Date.now() };
+      return { idx: (t.idx+1) % order.length, startedAt: Date.now() };
+    });
   });
 }
 

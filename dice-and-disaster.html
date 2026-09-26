@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dice & Disaster</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 16px; }
+  h1 { color: #ff6b6b; text-align: center; margin-bottom: 4px; }
+  .sub { text-align: center; color: #aaa; margin-bottom: 20px; font-size: 13px; }
+  .card { background: #16213e; border-radius: 12px; padding: 16px; margin-bottom: 14px; border: 1px solid #0f3460; }
+  input, select, button { width: 100%; padding: 12px; margin: 6px 0; border-radius: 8px; border: none; font-size: 15px; }
+  input, select { background: #0f3460; color: #eee; }
+  button { background: #ff6b6b; color: #1a1a2e; font-weight: bold; cursor: pointer; }
+  button:disabled { background: #555; color: #999; }
+  .class-opt { border: 2px solid #0f3460; padding: 10px; border-radius: 8px; margin: 6px 0; cursor: pointer; }
+  .class-opt.sel { border-color: #ff6b6b; background: #0f3460; }
+  .hp-bar { background: #0f3460; border-radius: 6px; height: 16px; overflow: hidden; margin-top: 4px; }
+  .hp-fill { background: linear-gradient(90deg,#4ecdc4,#44a08d); height: 100%; transition: width 0.4s; }
+  .player-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #0f3460; }
+  .dice { font-size: 48px; text-align: center; margin: 10px 0; }
+  .log { max-height: 160px; overflow-y: auto; font-size: 13px; color: #bbb; }
+  .log div { padding: 3px 0; border-bottom: 1px solid #222; }
+  .turn-badge { background: #ff6b6b; color: #1a1a2e; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>🎲 Dice & Disaster</h1>
+<div class="sub">a chaotic little DND for you and 4 friends</div>
+
+<!-- SETUP SCREEN: paste your Firebase config here -->
+<div id="setupScreen" class="card">
+  <b>One-time setup (host does this once):</b>
+  <p style="font-size:13px;color:#aaa">Create a free Firebase project → Realtime Database → copy your config below. See setup notes at the bottom of this file.</p>
+  <textarea id="fbConfigInput" rows="6" style="width:100%;background:#0f3460;color:#eee;border-radius:8px;border:none;padding:10px;font-family:monospace;font-size:12px;" placeholder='{"apiKey":"...","databaseURL":"...","projectId":"..."}'></textarea>
+  <button onclick="initFirebase()">Connect</button>
+</div>
+
+<!-- JOIN SCREEN -->
+<div id="joinScreen" class="card hidden">
+  <input id="nameInput" placeholder="Your name">
+  <input id="roomInput" placeholder="Room code (share with your 4 friends)">
+  <button onclick="joinRoom()">Join / Create Room</button>
+</div>
+<div id="leaveBar" class="hidden" style="text-align:center;margin-top:6px;">
+  <button onclick="newGame()" style="background:#555;color:#eee;">🔄 Leave & Start New Game</button>
+</div>
+
+<!-- CLASS SELECT -->
+<div id="classScreen" class="card hidden">
+  <b>Pick your class</b>
+  <div id="classList"></div>
+  <button id="lockBtn" onclick="lockClass()" disabled>Lock In</button>
+  <div class="card" style="margin-top:10px;">
+    <b>Party (<span id="pCount">0</span>/5)</b>
+    <div id="partyList"></div>
+    <button id="startBtn" onclick="startBattle()" class="hidden">Start Battle</button>
+  </div>
+</div>
+
+<!-- BATTLE SCREEN -->
+<div id="battleScreen" class="card hidden">
+  <b>👹 The Boss</b>
+  <div class="hp-bar"><div class="hp-fill" id="bossHpFill" style="width:100%"></div></div>
+  <div id="bossHpText" style="font-size:13px;color:#aaa"></div>
+
+  <div id="partyBattleList" style="margin:14px 0;"></div>
+
+  <div id="turnIndicator" style="text-align:center;font-weight:bold;margin:10px 0;"></div>
+  <div class="dice" id="diceDisplay">🎲</div>
+
+  <div id="actionButtons"></div>
+
+  <div class="card log" id="battleLog"></div>
+</div>
+
+<script>
+// ---- CLASSES ----
+const CLASSES = {
+  Warlord:   { hp: 30, atk: [6,10], special: "Rally (heal party +5)", emoji:"⚔️" },
+  Trickster: { hp: 22, atk: [4,14], special: "Backstab (double dmg, 40% chance)", emoji:"🗡️" },
+  Priest:    { hp: 24, atk: [3,7],  special: "Heal (self/ally +10 hp)", emoji:"✨" },
+  Berserker: { hp: 34, atk: [8,12], special: "Rage (+50% dmg, -5 hp)", emoji:"🪓" }
+};
+const BOSS = { name: "The Ibadan Traffic Demon", hp: 140, atk: [5,15] };
+
+let db, roomRef, roomCode, myName, myClass;
+
+function initFirebase(){
+  const raw = document.getElementById('fbConfigInput').value.trim();
+  let cfg;
+  try { cfg = JSON.parse(raw); } catch(e){ alert("Paste valid Firebase config JSON"); return; }
+  firebase.initializeApp(cfg);
+  db = firebase.database();
+  document.getElementById('setupScreen').classList.add('hidden');
+  document.getElementById('joinScreen').classList.remove('hidden');
+  localStorage.setItem('dd_fbcfg', raw); // per-viewer convenience only
+}
+
+// auto-restore config + identity for convenience on this device
+window.onload = () => {
+  const savedCfg = localStorage.getItem('dd_fbcfg');
+  if (savedCfg) document.getElementById('fbConfigInput').value = savedCfg;
+
+  const savedSession = localStorage.getItem('dd_session');
+  if (savedCfg && savedSession){
+    try {
+      const cfg = JSON.parse(savedCfg);
+      firebase.initializeApp(cfg);
+      db = firebase.database();
+      const sess = JSON.parse(savedSession);
+      myName = sess.name; roomCode = sess.room;
+      document.getElementById('setupScreen').classList.add('hidden');
+      enterRoom();
+    } catch(e){ /* fall back to manual setup screens */ }
+  }
+};
+
+function newGame(){
+  localStorage.removeItem('dd_session');
+  location.reload();
+}
+
+function joinRoom(){
+  myName = document.getElementById('nameInput').value.trim();
+  roomCode = document.getElementById('roomInput').value.trim().toUpperCase();
+  if(!myName || !roomCode){ alert("Enter name + room code"); return; }
+  localStorage.setItem('dd_session', JSON.stringify({ name: myName, room: roomCode })); // survive reloads on this device
+  enterRoom();
+}
+
+function enterRoom(){
+  document.getElementById('leaveBar').classList.remove('hidden');
+  roomRef = db.ref('rooms/' + roomCode);
+
+  roomRef.child('players/' + myName).once('value').then(snap => {
+    if(!snap.exists()){
+      roomRef.child('players/' + myName).set({ name: myName, class: null, hp: 0, maxHp:0, ready:false });
+      document.getElementById('joinScreen').classList.add('hidden');
+      document.getElementById('classScreen').classList.remove('hidden');
+      renderClassList();
+    } else {
+      // already joined before (reload case) - restore where we left off
+      const p = snap.val();
+      if(p.class){ myClass = p.class; }
+      document.getElementById('joinScreen').classList.add('hidden');
+      document.getElementById('classScreen').classList.remove('hidden');
+      renderClassList();
+      if(p.ready) document.getElementById('lockBtn').disabled = true;
+    }
+  });
+  roomRef.child('phase').once('value').then(snap => {
+    if(!snap.exists()) roomRef.child('phase').set('classSelect');
+  });
+
+  listenRoom();
+}
+
+function renderClassList(){
+  const list = document.getElementById('classList');
+  list.innerHTML = '';
+  Object.keys(CLASSES).forEach(cls => {
+    const c = CLASSES[cls];
+    const div = document.createElement('div');
+    div.className = 'class-opt' + (myClass===cls ? ' sel':'');
+    div.innerHTML = `<b>${c.emoji} ${cls}</b><br><span style="font-size:12px;color:#aaa">HP ${c.hp} · ATK ${c.atk[0]}-${c.atk[1]} · ${c.special}</span>`;
+    div.onclick = () => { myClass = cls; renderClassList(); document.getElementById('lockBtn').disabled=false; };
+    list.appendChild(div);
+  });
+}
+
+function lockClass(){
+  const c = CLASSES[myClass];
+  roomRef.child('players/' + myName).update({ class: myClass, hp: c.hp, maxHp: c.hp, ready: true });
+  document.getElementById('lockBtn').disabled = true;
+}
+
+function listenRoom(){
+  roomRef.child('players').on('value', snap => {
+    const players = snap.val() || {};
+    const keys = Object.keys(players);
+    document.getElementById('pCount').innerText = keys.length;
+    document.getElementById('partyList').innerHTML = keys.map(k => {
+      const p = players[k];
+      return `<div class="player-row">${p.name} ${p.class ? '— '+CLASSES[p.class].emoji+p.class : '(choosing...)'} ${p.ready?'✅':''}</div>`;
+    }).join('');
+    const allReady = keys.length >= 2 && keys.every(k => players[k].ready);
+    document.getElementById('startBtn').classList.toggle('hidden', !allReady);
+  });
+
+  roomRef.child('phase').on('value', snap => {
+    if(snap.val() === 'battle'){
+      document.getElementById('classScreen').classList.add('hidden');
+      document.getElementById('battleScreen').classList.remove('hidden');
+      listenBattle();
+    }
+  });
+}
+
+function startBattle(){
+  roomRef.child('boss').set({ name: BOSS.name, hp: BOSS.hp, maxHp: BOSS.hp });
+  roomRef.child('players').once('value').then(snap => {
+    const keys = Object.keys(snap.val());
+    roomRef.child('turnOrder').set(keys);
+    roomRef.child('turnIdx').set(0);
+    roomRef.child('log').set(["The battle begins! " + BOSS.name + " appears."]);
+    roomRef.child('phase').set('battle');
+  });
+}
+
+function listenBattle(){
+  roomRef.child('boss').on('value', snap => {
+    const b = snap.val(); if(!b) return;
+    const pct = Math.max(0, b.hp/b.maxHp*100);
+    document.getElementById('bossHpFill').style.width = pct+'%';
+    document.getElementById('bossHpText').innerText = `${Math.max(0,b.hp)} / ${b.maxHp} HP`;
+    if(b.hp <= 0) addActionButtons(false, true);
+  });
+
+  roomRef.child('players').on('value', snap => {
+    const players = snap.val() || {};
+    document.getElementById('partyBattleList').innerHTML = Object.keys(players).map(k => {
+      const p = players[k];
+      const pct = Math.max(0, p.hp/p.maxHp*100);
+      return `<div class="player-row"><span>${CLASSES[p.class]?.emoji||''} ${p.name}</span>
+        <span style="width:100px"><div class="hp-bar"><div class="hp-fill" style="width:${pct}%;background:${p.hp<=0?'#666':'linear-gradient(90deg,#4ecdc4,#44a08d)'}"></div></div></span></div>`;
+    }).join('');
+    checkTurn();
+  });
+
+  roomRef.child('turnIdx').on('value', () => checkTurn());
+  roomRef.child('log').on('value', snap => {
+    const logs = snap.val() || [];
+    document.getElementById('battleLog').innerHTML = logs.slice(-15).reverse().map(l=>`<div>${l}</div>`).join('');
+  });
+}
+
+function checkTurn(){
+  Promise.all([
+    roomRef.child('turnOrder').once('value'),
+    roomRef.child('turnIdx').once('value'),
+    roomRef.child('players').once('value'),
+    roomRef.child('boss').once('value')
+  ]).then(([orderSnap, idxSnap, pSnap, bSnap]) => {
+    const order = orderSnap.val() || [];
+    const idx = idxSnap.val() || 0;
+    const players = pSnap.val() || {};
+    const boss = bSnap.val();
+    if(!order.length || !boss) return;
+    const currentName = order[idx % order.length];
+    const isMyTurn = currentName === myName && boss.hp > 0 && players[myName]?.hp > 0;
+    document.getElementById('turnIndicator').innerHTML = boss.hp<=0
+      ? `🎉 ${BOSS.name} is defeated! GG.`
+      : (isMyTurn ? `<span class="turn-badge">YOUR TURN</span>` : `Waiting on ${currentName}...`);
+    addActionButtons(isMyTurn, boss.hp<=0);
+  });
+}
+
+function addActionButtons(isMyTurn, bossDead){
+  const box = document.getElementById('actionButtons');
+  if(bossDead || !isMyTurn){ box.innerHTML = ''; return; }
+  box.innerHTML = `<button onclick="doAction('attack')">⚔️ Attack</button><button onclick="doAction('special')">✨ Special</button>`;
+}
+
+function rollD20(){ return Math.floor(Math.random()*20)+1; }
+
+function doAction(type){
+  document.getElementById('actionButtons').innerHTML = '';
+  const roll = rollD20();
+  document.getElementById('diceDisplay').innerText = '🎲 ' + roll;
+
+  roomRef.child('players/'+myName).once('value').then(snap => {
+    const me = snap.val();
+    const cls = CLASSES[me.class];
+    let dmg = Math.floor(cls.atk[0] + (roll/20)*(cls.atk[1]-cls.atk[0]));
+    let msg = '';
+
+    if(type === 'attack'){
+      msg = `${me.name} rolls ${roll} and attacks for ${dmg} dmg!`;
+    } else {
+      if(me.class === 'Warlord'){
+        msg = `${me.name} rallies the party! +5 HP each.`;
+        roomRef.child('players').once('value').then(ps => {
+          Object.keys(ps.val()).forEach(k => {
+            const p = ps.val()[k];
+            roomRef.child('players/'+k+'/hp').set(Math.min(p.maxHp, p.hp+5));
+          });
+        });
+        dmg = 0;
+      } else if(me.class === 'Trickster'){
+        const crit = Math.random() < 0.4;
+        dmg = crit ? dmg*2 : dmg;
+        msg = crit ? `${me.name} BACKSTABS for ${dmg} dmg!!` : `${me.name}'s backstab fizzles, ${dmg} dmg.`;
+      } else if(me.class === 'Priest'){
+        roomRef.child('players/'+myName+'/hp').set(Math.min(me.maxHp, me.hp+10));
+        msg = `${me.name} heals for 10 HP.`;
+        dmg = 0;
+      } else if(me.class === 'Berserker'){
+        dmg = Math.floor(dmg*1.5);
+        roomRef.child('players/'+myName+'/hp').set(Math.max(0, me.hp-5));
+        msg = `${me.name} RAGES for ${dmg} dmg (takes 5 self-dmg)!`;
+      }
+    }
+
+    roomRef.child('boss/hp').transaction(hp => Math.max(0, (hp||0) - dmg));
+    pushLog(msg);
+
+    // boss counter-attacks a random alive player, then advance turn
+    setTimeout(() => {
+      roomRef.child('boss').once('value').then(bs => {
+        if(bs.val().hp <= 0){ advanceTurn(); return; }
+        roomRef.child('players').once('value').then(ps => {
+          const alive = Object.keys(ps.val()).filter(k => ps.val()[k].hp > 0);
+          if(!alive.length) return;
+          const target = alive[Math.floor(Math.random()*alive.length)];
+          const bdmg = Math.floor(BOSS.atk[0]+Math.random()*(BOSS.atk[1]-BOSS.atk[0]));
+          roomRef.child('players/'+target+'/hp').transaction(hp => Math.max(0, hp-bdmg));
+          pushLog(`${BOSS.name} hits ${target} for ${bdmg} dmg!`);
+          advanceTurn();
+        });
+      });
+    }, 800);
+  });
+}
+
+function advanceTurn(){
+  roomRef.child('turnOrder').once('value').then(snap => {
+    const order = snap.val();
+    roomRef.child('turnIdx').transaction(idx => ((idx||0)+1) % order.length);
+  });
+}
+
+function pushLog(msg){
+  roomRef.child('log').once('value').then(snap => {
+    const logs = snap.val() || [];
+    logs.push(msg);
+    roomRef.child('log').set(logs.slice(-50));
+  });
+}
+</script>
+
+<!--
+SETUP NOTES (one-time, host does this):
+1. Go to console.firebase.google.com → Create project (free tier is plenty)
+2. Build > Realtime Database > Create Database > start in test mode
+3. Project settings (gear icon) > General > scroll to "Your apps" > Add app > Web (</>) 
+4. Copy the firebaseConfig object it gives you (apiKey, databaseURL, projectId, etc)
+5. Open this file, paste that JSON into the "Connect" box on first load
+6. Send this same HTML file to your 4 friends — they paste the SAME config
+7. Everyone picks a room code (like "SQUAD1") to land in the same game
+Test mode DB rules expire after 30 days — fine for casual play, just re-open rules if it locks out.
+-->
+
+</body>
+</html>
